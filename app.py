@@ -204,6 +204,15 @@ def delete_payment_method(cookies, random_person, url):
 @validate_input
 def get_token(card_number, month, year, cvv, random_person, access_token):
     """Generate payment token through Braintree API"""
+    # Validate inputs
+    if not all([card_number, month, year, cvv, random_person, access_token]):
+        logger.error("Missing required parameters in get_token")
+        return None, None
+    
+    if not isinstance(random_person, dict) or 'zipcode' not in random_person:
+        logger.error("Invalid random_person parameter")
+        return None, None
+
     headers = {
         'Authorization': f'Bearer {access_token}',
         'braintree-version': '2018-05-10',
@@ -221,7 +230,7 @@ def get_token(card_number, month, year, cvv, random_person, access_token):
             "input": {
             "creditCard": {
                 "number": card_number,
-                "expirationMonth":  month,
+                "expirationMonth": month,
                 "expirationYear": year,
                 "cvv": cvv,
                 "billingAddress": {
@@ -245,16 +254,25 @@ def get_token(card_number, month, year, cvv, random_person, access_token):
             timeout=REQUEST_TIMEOUT
         )
         response.raise_for_status()
-        brandCode = response.json()['data']['tokenizeCreditCard']['creditCard']['brandCode']
-        token = response.json()['data']['tokenizeCreditCard']['token']
+        response_data = response.json()
+        
+        # Validate response structure
+        if not response_data.get('data', {}).get('tokenizeCreditCard'):
+            logger.error("Unexpected response structure from Braintree API")
+            return None, None
+            
+        token_data = response_data['data']['tokenizeCreditCard']
+        brandCode = token_data['creditCard']['brandCode']
+        token = token_data['token']
         return token, brandCode
+        
     except requests.RequestException as e:
         logger.error(f"Request failed in get_token: {str(e)}")
-        return None
-    except KeyError as e:
-        logger.error(f"Token not found in response: {str(e)}")
-        return None
-
+        return None, None
+    except (KeyError, ValueError) as e:
+        logger.error(f"Invalid response data: {str(e)}")
+        return None, None
+    
 def process_payment(token, random_person, cookies, nonce, url, success_xpath, error_xpath, brandCode):
     """Execute payment processing through WooCommerce endpoint"""
     parsed_url = urlparse(url)
